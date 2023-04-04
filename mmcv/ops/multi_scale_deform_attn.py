@@ -1,16 +1,19 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import math
 import warnings
+from typing import Optional, no_type_check
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd.function import Function, once_differentiable
 
+import mmcv
 from mmcv import deprecated_api_warning
 from mmcv.cnn import constant_init, xavier_init
 from mmcv.cnn.bricks.registry import ATTENTION
 from mmcv.runner import BaseModule
+from mmcv.utils import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE
 from ..utils import ext_loader
 
 ext_module = ext_loader.load_ext(
@@ -20,9 +23,12 @@ ext_module = ext_loader.load_ext(
 class MultiScaleDeformableAttnFunction(Function):
 
     @staticmethod
-    def forward(ctx, value, value_spatial_shapes, value_level_start_index,
-                sampling_locations, attention_weights, im2col_step):
-        """GPU version of multi-scale deformable attention.
+    def forward(ctx, value: torch.Tensor, value_spatial_shapes: torch.Tensor,
+                value_level_start_index: torch.Tensor,
+                sampling_locations: torch.Tensor,
+                attention_weights: torch.Tensor,
+                im2col_step: torch.Tensor) -> torch.Tensor:
+        """GPU/MLU version of multi-scale deformable attention.
 
         Args:
             value (torch.Tensor): The value has shape
@@ -37,13 +43,25 @@ class MultiScaleDeformableAttnFunction(Function):
             attention_weights (torch.Tensor): The weight of sampling points
                 used when calculate the attention, has shape
                 (bs ,num_queries, num_heads, num_levels, num_points),
-            im2col_step (Tensor): The step used in image to column.
+            im2col_step (torch.Tensor): The step used in image to column.
 
         Returns:
             torch.Tensor: has shape (bs, num_queries, embed_dims)
         """
 
         ctx.im2col_step = im2col_step
+
+        # When pytorch version >= 1.6.0, amp is adopted for fp16 mode;
+        # amp won't cast the type of sampling_locations, attention_weights
+        # (float32), but "value" is cast to float16, leading to the type
+        # mismatch with input (when it is float32) or weight.
+        # The flag for whether to use fp16 or amp is the type of "value",
+        # we cast sampling_locations and attention_weights to
+        # temporarily support fp16 and amp whatever the
+        # pytorch version is.
+        sampling_locations = sampling_locations.type_as(value)
+        attention_weights = attention_weights.type_as(value)
+
         output = ext_module.ms_deform_attn_forward(
             value,
             value_spatial_shapes,
@@ -58,8 +76,8 @@ class MultiScaleDeformableAttnFunction(Function):
 
     @staticmethod
     @once_differentiable
-    def backward(ctx, grad_output):
-        """GPU version of backward function.
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        """GPU/MLU version of backward function.
 
         Args:
             grad_output (torch.Tensor): Gradient of output tensor of forward.
@@ -89,8 +107,10 @@ class MultiScaleDeformableAttnFunction(Function):
             grad_sampling_loc, grad_attn_weight, None
 
 
-def multi_scale_deformable_attn_pytorch(value, value_spatial_shapes,
-                                        sampling_locations, attention_weights):
+def multi_scale_deformable_attn_pytorch(
+        value: torch.Tensor, value_spatial_shapes: torch.Tensor,
+        sampling_locations: torch.Tensor,
+        attention_weights: torch.Tensor) -> torch.Tensor:
     """CPU version of multi-scale deformable attention.
 
     Args:
@@ -159,7 +179,7 @@ class MultiScaleDeformableAttention(BaseModule):
     Args:
         embed_dims (int): The embedding dimension of Attention.
             Default: 256.
-        num_heads (int): Parallel attention heads. Default: 64.
+        num_heads (int): Parallel attention heads. Default: 8.
         num_levels (int): The number of feature map used in
             Attention. Default: 4.
         num_points (int): The number of sampling points for
@@ -178,15 +198,15 @@ class MultiScaleDeformableAttention(BaseModule):
     """
 
     def __init__(self,
-                 embed_dims=256,
-                 num_heads=8,
-                 num_levels=4,
-                 num_points=4,
-                 im2col_step=64,
-                 dropout=0.1,
-                 batch_first=False,
-                 norm_cfg=None,
-                 init_cfg=None):
+                 embed_dims: int = 256,
+                 num_heads: int = 8,
+                 num_levels: int = 4,
+                 num_points: int = 4,
+                 im2col_step: int = 64,
+                 dropout: float = 0.1,
+                 batch_first: bool = False,
+                 norm_cfg: Optional[dict] = None,
+                 init_cfg: Optional[mmcv.ConfigDict] = None):
         super().__init__(init_cfg)
         if embed_dims % num_heads != 0:
             raise ValueError(f'embed_dims must be divisible by num_heads, '
@@ -225,12 +245,13 @@ class MultiScaleDeformableAttention(BaseModule):
         self.output_proj = nn.Linear(embed_dims, embed_dims)
         self.init_weights()
 
-    def init_weights(self):
+    def init_weights(self) -> None:
         """Default initialization for Parameters of Module."""
         constant_init(self.sampling_offsets, 0.)
+        device = next(self.parameters()).device
         thetas = torch.arange(
-            self.num_heads,
-            dtype=torch.float32) * (2.0 * math.pi / self.num_heads)
+            self.num_heads, dtype=torch.float32,
+            device=device) * (2.0 * math.pi / self.num_heads)
         grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
         grid_init = (grid_init /
                      grid_init.abs().max(-1, keepdim=True)[0]).view(
@@ -245,19 +266,20 @@ class MultiScaleDeformableAttention(BaseModule):
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
         self._is_init = True
 
+    @no_type_check
     @deprecated_api_warning({'residual': 'identity'},
                             cls_name='MultiScaleDeformableAttention')
     def forward(self,
-                query,
-                key=None,
-                value=None,
-                identity=None,
-                query_pos=None,
-                key_padding_mask=None,
-                reference_points=None,
-                spatial_shapes=None,
-                level_start_index=None,
-                **kwargs):
+                query: torch.Tensor,
+                key: Optional[torch.Tensor] = None,
+                value: Optional[torch.Tensor] = None,
+                identity: Optional[torch.Tensor] = None,
+                query_pos: Optional[torch.Tensor] = None,
+                key_padding_mask: Optional[torch.Tensor] = None,
+                reference_points: Optional[torch.Tensor] = None,
+                spatial_shapes: Optional[torch.Tensor] = None,
+                level_start_index: Optional[torch.Tensor] = None,
+                **kwargs) -> torch.Tensor:
         """Forward Function of MultiScaleDeformAttention.
 
         Args:
@@ -272,8 +294,8 @@ class MultiScaleDeformableAttention(BaseModule):
                 `query` will be used.
             query_pos (torch.Tensor): The positional encoding for `query`.
                 Default: None.
-            key_pos (torch.Tensor): The positional encoding for `key`. Default
-                None.
+            key_padding_mask (torch.Tensor): ByteTensor for `query`, with
+                shape [bs, num_key].
             reference_points (torch.Tensor):  The normalized reference
                 points with shape (bs, num_query, num_levels, 2),
                 all elements is range in [0, 1], top-left (0,0),
@@ -281,8 +303,6 @@ class MultiScaleDeformableAttention(BaseModule):
                 or (N, Length_{query}, num_levels, 4), add
                 additional two dimensions is (w, h) to
                 form reference boxes.
-            key_padding_mask (torch.Tensor): ByteTensor for `query`, with
-                shape [bs, num_key].
             spatial_shapes (torch.Tensor): Spatial shape of features in
                 different levels. With shape (num_levels, 2),
                 last dimension represents (h, w).
@@ -340,7 +360,8 @@ class MultiScaleDeformableAttention(BaseModule):
             raise ValueError(
                 f'Last dim of reference_points must be'
                 f' 2 or 4, but get {reference_points.shape[-1]} instead.')
-        if torch.cuda.is_available() and value.is_cuda:
+        if ((IS_CUDA_AVAILABLE and value.is_cuda)
+                or (IS_MLU_AVAILABLE and value.is_mlu)):
             output = MultiScaleDeformableAttnFunction.apply(
                 value, spatial_shapes, level_start_index, sampling_locations,
                 attention_weights, self.im2col_step)

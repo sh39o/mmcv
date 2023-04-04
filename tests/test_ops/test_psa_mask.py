@@ -1,7 +1,10 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
+
+from mmcv.utils import IS_CUDA_AVAILABLE, IS_MLU_AVAILABLE, IS_NPU_AVAILABLE
 
 
 class Loss(nn.Module):
@@ -17,9 +20,21 @@ class Loss(nn.Module):
 
 class TestPSAMask:
 
-    def test_psa_mask_collect(self):
-        if not torch.cuda.is_available():
-            return
+    @pytest.mark.parametrize('device', [
+        pytest.param(
+            'cuda',
+            marks=pytest.mark.skipif(
+                not IS_CUDA_AVAILABLE, reason='requires CUDA support')),
+        pytest.param(
+            'mlu',
+            marks=pytest.mark.skipif(
+                not IS_MLU_AVAILABLE, reason='requires MLU support')),
+        pytest.param(
+            'npu',
+            marks=pytest.mark.skipif(
+                not IS_NPU_AVAILABLE, reason='requires NPU support'))
+    ])
+    def test_psa_mask_collect(self, device):
         from mmcv.ops import PSAMask
         test_loss = Loss()
 
@@ -45,11 +60,11 @@ class TestPSAMask:
         assert np.allclose(test_output, output_collect)
         assert test_output.shape == output_collect.shape
 
-        psamask_collect.cuda()
-        input = input.cuda()
-        label = label.cuda()
+        psamask_collect.to(device)
+        input = input.to(device)
+        label = label.to(device)
 
-        # test collect cuda
+        # test collect on device
         test_output = psamask_collect(input)
         loss = test_loss(test_output, label)
         loss.backward()
@@ -57,9 +72,21 @@ class TestPSAMask:
         assert np.allclose(test_output, output_collect)
         assert test_output.shape == output_collect.shape
 
-    def test_psa_mask_distribute(self):
-        if not torch.cuda.is_available():
-            return
+    @pytest.mark.parametrize('device', [
+        pytest.param(
+            'cuda',
+            marks=pytest.mark.skipif(
+                not IS_CUDA_AVAILABLE, reason='requires CUDA support')),
+        pytest.param(
+            'mlu',
+            marks=pytest.mark.skipif(
+                not IS_MLU_AVAILABLE, reason='requires MLU support')),
+        pytest.param(
+            'npu',
+            marks=pytest.mark.skipif(
+                not IS_NPU_AVAILABLE, reason='requires NPU support'))
+    ])
+    def test_psa_mask_distribute(self, device):
         from mmcv.ops import PSAMask
         test_loss = Loss()
 
@@ -86,11 +113,11 @@ class TestPSAMask:
         assert np.allclose(test_output, output_distribute)
         assert test_output.shape == output_distribute.shape
 
-        psamask_distribute.cuda()
-        input = input.cuda()
-        label = label.cuda()
+        psamask_distribute.to(device)
+        input = input.to(device)
+        label = label.to(device)
 
-        # test distribute cuda
+        # test distribute on device
         test_output = psamask_distribute(input)
         loss = test_loss(test_output, label)
         loss.backward()

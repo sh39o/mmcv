@@ -24,16 +24,11 @@ def calc_square_dist(point_feat_a: Tensor,
         torch.Tensor: (B, N, M) Square distance between each point pair.
     """
     num_channel = point_feat_a.shape[-1]
-    # [bs, n, 1]
-    a_square = torch.sum(point_feat_a.unsqueeze(dim=2).pow(2), dim=-1)
-    # [bs, 1, m]
-    b_square = torch.sum(point_feat_b.unsqueeze(dim=1).pow(2), dim=-1)
-
-    corr_matrix = torch.matmul(point_feat_a, point_feat_b.transpose(1, 2))
-
-    dist = a_square + b_square - 2 * corr_matrix
+    dist = torch.cdist(point_feat_a, point_feat_b)
     if norm:
-        dist = torch.sqrt(dist) / num_channel
+        dist = dist / num_channel
+    else:
+        dist = torch.square(dist)
     return dist
 
 
@@ -104,7 +99,6 @@ class PointsSampler(nn.Module):
         """
         indices = []
         last_fps_end_index = 0
-
         for fps_sample_range, sampler, npoint in zip(
                 self.fps_sample_range_list, self.samplers, self.num_point):
             assert fps_sample_range < points_xyz.shape[1]
@@ -116,8 +110,8 @@ class PointsSampler(nn.Module):
                 else:
                     sample_features = None
             else:
-                sample_points_xyz = \
-                    points_xyz[:, last_fps_end_index:fps_sample_range]
+                sample_points_xyz = points_xyz[:, last_fps_end_index:
+                                               fps_sample_range]
                 if features is not None:
                     sample_features = features[:, :, last_fps_end_index:
                                                fps_sample_range]
@@ -128,7 +122,7 @@ class PointsSampler(nn.Module):
                               npoint)
 
             indices.append(fps_idx + last_fps_end_index)
-            last_fps_end_index += fps_sample_range
+            last_fps_end_index = fps_sample_range
         indices = torch.cat(indices, dim=1)
 
         return indices

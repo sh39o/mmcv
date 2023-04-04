@@ -282,11 +282,11 @@ nvinfer1::IPluginV2 *DeformableConvPluginDynamicCreator::createPlugin(
       }
     }
 
-    if (field_name.compare("deformable_group") == 0) {
+    if (field_name.compare("deform_groups") == 0) {
       deformableGroup = static_cast<const int *>(fc->fields[i].data)[0];
     }
 
-    if (field_name.compare("group") == 0) {
+    if (field_name.compare("groups") == 0) {
       group = static_cast<const int *>(fc->fields[i].data)[0];
     }
 
